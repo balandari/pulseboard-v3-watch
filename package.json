@@ -1,0 +1,12 @@
+{
+  "name": "pulseboard-v3-watch",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A small watcher that tells ntfy when thepulseboard.io breaks and when it is fixed.",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test",
+    "dry-run": "node watch.mjs --dry-run"
+  }
+}
