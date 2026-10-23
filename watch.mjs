@@ -1,4 +1,4 @@
-// PulseBoard alert watcher. Node 20+, no packages.
+// PulseBoard alert watcher. Node 20.11+, no packages.
 // Checks thepulseboard.io, and tells ntfy when something breaks and when it is fixed.
 // It reads and writes only words and times; it never touches anyone's holdings.
 
@@ -14,7 +14,6 @@ export const TIMEOUT_MS = 15_000; // a request that takes longer fails its check
 export const STALE_MS = 60_000; // the app's own stale line (FRESHNESS.staleMs)
 export const SECOND_LOOK_MS = 120_000; // wait before the second look
 const ZONE = 'America/Chicago';
-const CHECK_ORDER = ['page', 'health', 'snapshot'];
 
 // ---------- Central time ----------
 
@@ -83,7 +82,7 @@ async function withTimeout(fn, timeoutMs) {
 async function get(url, { fetch, timeoutMs }) {
   try {
     return await withTimeout(async (signal) => {
-      const res = await fetch(url, { method: 'GET', cache: 'no-store', signal });
+      const res = await fetch(url, { method: 'GET', cache: 'no-store', redirect: 'manual', signal });
       const text = await res.text();
       return { status: res.status, text };
     }, timeoutMs);
@@ -149,6 +148,7 @@ async function checkSnapshot(ctx) {
   const asOf = typeof body.asOf === 'string' ? Date.parse(body.asOf) : NaN;
   if (Number.isNaN(asOf)) return fail('snapshot', 'snapshot', 'asOf missing');
   const ageMs = ctx.now() - asOf;
+  if (ageMs < -STALE_MS) return fail('snapshot', 'snapshot', 'asOf in the future');
   if (ageMs >= STALE_MS) {
     return fail('snapshot', 'snapshot-stale', `asOf ${Math.floor(ageMs / 1000)} s old`, { ageMs });
   }
@@ -163,24 +163,29 @@ export async function runChecks({ fetch = globalThis.fetch, now = Date.now, time
 
 // ---------- messages ----------
 
-function faultMessage(fault, ageMs, sinceMs) {
-  const since = `(since ${centralTime(sinceMs)})`;
+function faultPhrase(fault, ageMs) {
   switch (fault) {
     case 'page':
-      return `PulseBoard: the site is not answering ${since}`;
+      return 'the site is not answering';
     case 'health-store':
-      return `PulseBoard: the database check failed ${since}`;
+      return 'the database check failed';
     case 'health-signin':
-      return `PulseBoard: the sign-in check failed ${since}`;
+      return 'the sign-in check failed';
     case 'health':
-      return `PulseBoard: the health check failed ${since}`;
+      return 'the health check failed';
     case 'snapshot-stale': {
       const minutes = Math.max(1, Math.floor(ageMs / 60_000));
-      return `PulseBoard: prices on the site are ${minutes} ${minutes === 1 ? 'minute' : 'minutes'} old ${since}`;
+      return `prices on the site are ${minutes} ${minutes === 1 ? 'minute' : 'minutes'} old`;
     }
     default:
-      return `PulseBoard: the prices on the site are not available ${since}`;
+      return 'the prices on the site are not available';
   }
+}
+
+// One message for the whole set of broken things, in check order.
+function faultsMessage(results, sinceMs) {
+  const phrases = results.map((r) => faultPhrase(r.fault, r.ageMs));
+  return `PulseBoard: ${phrases.join(' and ')} (since ${centralTime(sinceMs)})`;
 }
 
 const fixedMessage = (sinceMs) => `PulseBoard: fixed, all fine since ${centralTime(sinceMs)}`;
@@ -193,6 +198,7 @@ export async function sendNtfy({ fetch = globalThis.fetch, topic, message, timeo
     status = await withTimeout(async (signal) => {
       const res = await fetch(`https://ntfy.sh/${topic}`, {
         method: 'POST',
+        redirect: 'manual',
         headers: { Title: 'PulseBoard' },
         body: message,
         signal,
@@ -250,17 +256,21 @@ export async function watch({
   const first = await runChecks({ fetch, now, timeoutMs });
   logResults(log, first);
 
+  // The state is the set of confirmed fault codes in check order joined by "+", or "ok".
   let confirmed = [];
   let lastMs = firstMs;
-  if (first.some((r) => !r.ok)) {
+  let secondAllPass = false;
+  const firstFailed = first.some((r) => !r.ok);
+  if (firstFailed) {
     log('a check failed; second look in 2 minutes');
     await wait(SECOND_LOOK_MS);
     const second = await runChecks({ fetch, now, timeoutMs });
     logResults(log, second);
     lastMs = now();
-    // only a fault seen both times counts
-    confirmed = second.filter((r) => !r.ok && first.some((f) => f.name === r.name && !f.ok));
-    confirmed.sort((a, b) => CHECK_ORDER.indexOf(a.name) - CHECK_ORDER.indexOf(b.name));
+    secondAllPass = second.every((r) => r.ok);
+    // only a fault code seen on both looks counts (checks run in check order)
+    const firstCodes = new Set(first.filter((r) => !r.ok).map((r) => r.fault));
+    confirmed = second.filter((r) => !r.ok && firstCodes.has(r.fault));
   }
 
   let prev = null;
@@ -272,21 +282,24 @@ export async function watch({
   const prevName = prev && typeof prev.state === 'string' ? prev.state : null;
   const week = isoWeek(lastMs);
 
+  // What the state becomes. A fault seen only once is not news, so when nothing is confirmed
+  // and the second look still had a failure, the state stays exactly as it was.
+  let stateName;
+  if (!firstFailed) stateName = 'ok';
+  else if (confirmed.length > 0) stateName = confirmed.map((r) => r.fault).join('+');
+  else if (secondAllPass) stateName = 'ok';
+  else stateName = prevName ?? 'ok';
+
   let next;
   let message = null;
-  if (confirmed.length > 0) {
-    const worst = confirmed[0];
-    if (worst.fault === prevName) {
-      next = { state: prev.state, since: prev.since, checkedWeek: week };
-    } else {
-      next = { state: worst.fault, since: centralISO(firstMs), checkedWeek: week };
-      message = faultMessage(worst.fault, worst.ageMs, firstMs);
-    }
-  } else if (prevName === 'ok') {
-    next = { state: 'ok', since: prev.since, checkedWeek: week };
-  } else {
+  if (stateName === prevName) {
+    next = { state: prev.state, since: prev.since, checkedWeek: week };
+  } else if (stateName === 'ok') {
     next = { state: 'ok', since: centralISO(lastMs), checkedWeek: week };
     if (prevName !== null) message = fixedMessage(lastMs);
+  } else {
+    next = { state: stateName, since: centralISO(firstMs), checkedWeek: week };
+    message = faultsMessage(confirmed, firstMs);
   }
 
   const messages = message ? [message] : [];
@@ -301,7 +314,10 @@ export async function watch({
       await send({ topic, message });
       log('notify: sent');
     } catch {
-      log('notify: fail (could not send)'); // the state stays as it was, so the next run tries again
+      log('notify: fail (could not send)');
+      // The state stays as it was, so the next run tries again; only the week moves, so the
+      // weekly keep-alive never stops during a long ntfy outage.
+      if (prev && prev.checkedWeek !== week) writeState({ state: prev.state, since: prev.since, checkedWeek: week });
       return { ok: false, messages: [], state: prev };
     }
   }

@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import {
   watch,
   runChecks,
@@ -27,6 +28,8 @@ function makeWorld(overrides = {}) {
     snapshotAgeMs: 5_000,
     snapshot: { status: 200, source: 'coinbase', coins: [{ symbol: 'BTC' }] },
     calls: [],
+    ntfyCalls: [],
+    ntfyStatus: 200,
     waits: [],
     sent: [],
     logs: [],
@@ -43,7 +46,11 @@ function makeWorld(overrides = {}) {
     if (w.onWait) w.onWait(w);
   };
   w.fetch = async (url, init = {}) => {
-    w.calls.push({ url, method: init.method ?? 'GET' });
+    if (String(url).startsWith('https://ntfy.sh/')) {
+      w.ntfyCalls.push({ url, init });
+      return new Response('{}', { status: w.ntfyStatus });
+    }
+    w.calls.push({ url, method: init.method ?? 'GET', redirect: init.redirect });
     const answer = (what) => {
       if (what === 'hang') return new Promise(() => {});
       if (what === 'throw') throw new TypeError('fetch failed');
@@ -68,6 +75,7 @@ function makeWorld(overrides = {}) {
         coins: s.coins,
       };
       if (s.noAsOf) delete body.asOf;
+      if (s.asOf) body.asOf = s.asOf(w.t);
       return new Response(JSON.stringify(body), { status: s.status });
     }
     throw new Error('unexpected address ' + url);
@@ -287,6 +295,7 @@ test('only GET requests, only the three addresses', async () => {
   await watch(w.opts());
   assert.ok(w.calls.length >= 3);
   for (const c of w.calls) assert.equal(c.method, 'GET');
+  for (const c of w.calls) assert.equal(c.redirect, 'manual');
   assert.deepEqual([...new Set(w.calls.map((c) => c.url))].sort(), Object.values(URLS).sort());
 });
 
@@ -475,13 +484,10 @@ test('dry run: runs the checks, shows the message, sends and saves nothing, need
 
 // ---------- what is allowed to appear ----------
 
+const PHRASE =
+  '(?:the site is not answering|the database check failed|the sign-in check failed|the health check failed|prices on the site are \\d+ minutes? old|the prices on the site are not available)';
 const ALLOWED_MESSAGES = [
-  /^PulseBoard: the site is not answering \(since \d\d:\d\d\)$/,
-  /^PulseBoard: the database check failed \(since \d\d:\d\d\)$/,
-  /^PulseBoard: the sign-in check failed \(since \d\d:\d\d\)$/,
-  /^PulseBoard: the health check failed \(since \d\d:\d\d\)$/,
-  /^PulseBoard: prices on the site are \d+ minutes? old \(since \d\d:\d\d\)$/,
-  /^PulseBoard: the prices on the site are not available \(since \d\d:\d\d\)$/,
+  new RegExp('^PulseBoard: ' + PHRASE + '(?: and ' + PHRASE + ')* \\(since \\d\\d:\\d\\d\\)$'),
   /^PulseBoard: fixed, all fine since \d\d:\d\d$/,
 ];
 
@@ -555,4 +561,200 @@ test('a notification that ntfy refuses throws without the topic in the error', a
     sendNtfy({ fetch: fake, topic: TOPIC, message: 'x' }),
     (err) => !String(err.message).includes(TOPIC),
   );
+});
+
+// ---------- fix round 1 ----------
+
+test('a fault that goes on, then a second thing breaks: one message naming both', async () => {
+  const w = makeWorld({ stored: { state: 'page', since: '2026-10-22T20:13:00-05:00', checkedWeek: '2026-W43' }, page: { status: 500 } });
+  w.health.body.store = 'error';
+  w.t += 10 * MIN; // 20:23
+  await watch(w.opts());
+  assert.deepEqual(w.sent.map((s) => s.message), [
+    'PulseBoard: the site is not answering and the database check failed (since 20:23)',
+  ]);
+  assert.equal(w.stored.state, 'page+health-store');
+  assert.equal(w.stored.since, '2026-10-22T20:23:00-05:00');
+  w.t += 10 * MIN;
+  await watch(w.opts()); // same set: nothing new
+  assert.equal(w.sent.length, 1);
+});
+
+test('three broken things are joined in check order', async () => {
+  const w = makeWorld({ stored: okState(), page: { status: 500 }, snapshotAgeMs: 241_000 });
+  w.health.body.signin = 'down';
+  await watch(w.opts());
+  assert.deepEqual(w.sent.map((s) => s.message), [
+    'PulseBoard: the site is not answering and the sign-in check failed and prices on the site are 4 minutes old (since 20:13)',
+  ]);
+  assert.equal(w.stored.state, 'page+health-signin+snapshot-stale');
+});
+
+test('one thing mends while another stays broken: a message for the smaller set, never "fixed"', async () => {
+  const w = makeWorld({ stored: { state: 'page+health-store', since: '2026-10-22T20:13:00-05:00', checkedWeek: '2026-W43' } });
+  w.health.body.store = 'error';
+  await watch(w.opts());
+  assert.deepEqual(w.sent.map((s) => s.message), ['PulseBoard: the database check failed (since 20:13)']);
+  assert.equal(w.stored.state, 'health-store');
+});
+
+test('"fixed" is never sent while a check fails: an outage followed by a different failure keeps the state', async () => {
+  const stored = { state: 'page', since: '2026-10-22T20:13:00-05:00', checkedWeek: '2026-W43' };
+  const w = makeWorld({ stored, page: { status: 500 } });
+  w.onWait = (world) => { world.page = { status: 200 }; world.health.body.store = 'error'; };
+  await watch(w.opts());
+  assert.equal(w.sent.length, 0);
+  assert.equal(w.stateWrites.length, 0);
+  assert.deepEqual(w.stored, stored);
+});
+
+test('different faults of one check do not confirm each other (store first, sign-in second)', async () => {
+  const w = makeWorld({ stored: okState() });
+  w.health.body.store = 'error';
+  w.onWait = (world) => { world.health.body.store = 'ok'; world.health.body.signin = 'down'; };
+  await watch(w.opts());
+  assert.equal(w.sent.length, 0);
+  assert.deepEqual(w.stored, okState());
+});
+
+test('a fault seen once that clears on the second look, from an alerted state, is "fixed"', async () => {
+  const w = makeWorld({ stored: { state: 'page', since: '2026-10-22T20:00:00-05:00', checkedWeek: '2026-W43' }, page: { status: 500 } });
+  w.onWait = (world) => { world.page = { status: 200 }; };
+  await watch(w.opts());
+  assert.deepEqual(w.sent.map((s) => s.message), ['PulseBoard: fixed, all fine since 20:15']);
+  assert.equal(w.stored.state, 'ok');
+});
+
+test('every request uses redirect "manual" and a 302 fails the check', async () => {
+  const w = makeWorld({ page: { status: 302 } });
+  const r = await runChecks({ fetch: w.fetch, now: w.now, timeoutMs: 50 });
+  assert.equal(r.find((c) => c.name === 'page').ok, false);
+  assert.equal(r.find((c) => c.name === 'page').reason, 'status 302');
+  for (const status of [301, 307, 308]) {
+    const x = makeWorld({ health: { status, body: {} }, snapshot: { status, source: 'coinbase', coins: [{}] } });
+    const rr = await runChecks({ fetch: x.fetch, now: x.now, timeoutMs: 50 });
+    assert.equal(rr.find((c) => c.name === 'health').ok, false);
+    assert.equal(rr.find((c) => c.name === 'snapshot').ok, false);
+  }
+  for (const c of w.calls) assert.equal(c.redirect, 'manual');
+});
+
+test('the notification request uses redirect "manual" and a 302 answer is a failed send', async () => {
+  const seen = [];
+  const fake = async (url, init) => {
+    seen.push(init);
+    return new Response('', { status: 302 });
+  };
+  await assert.rejects(sendNtfy({ fetch: fake, topic: TOPIC, message: 'x' }));
+  assert.equal(seen[0].redirect, 'manual');
+});
+
+test('an asOf in the future fails as snapshot; 60 s ahead is still allowed, 61 s is not', async () => {
+  const ahead = (ms) => ({ status: 200, source: 'coinbase', coins: [{}], asOf: (t) => new Date(t + ms).toISOString() });
+  const tomorrow = makeWorld({ snapshot: ahead(86_400_000) });
+  const r = await runChecks({ fetch: tomorrow.fetch, now: tomorrow.now, timeoutMs: 50 });
+  const s = r.find((c) => c.name === 'snapshot');
+  assert.equal(s.ok, false);
+  assert.equal(s.fault, 'snapshot');
+  assert.equal(s.reason, 'asOf in the future');
+
+  const edge = makeWorld({ snapshot: ahead(60_000) });
+  const re = await runChecks({ fetch: edge.fetch, now: edge.now, timeoutMs: 50 });
+  assert.equal(re.find((c) => c.name === 'snapshot').ok, true);
+
+  const over = makeWorld({ snapshot: ahead(61_000) });
+  const ro = await runChecks({ fetch: over.fetch, now: over.now, timeoutMs: 50 });
+  assert.equal(ro.find((c) => c.name === 'snapshot').reason, 'asOf in the future');
+});
+
+test('a failed send keeps the state but moves checkedWeek, and the run still fails', async () => {
+  const w = makeWorld({ stored: okState('2026-W42'), page: { status: 500 }, sendError: true });
+  const r = await watch(w.opts());
+  assert.equal(r.ok, false);
+  assert.equal(w.sent.length, 0);
+  assert.deepEqual(w.stored, { state: 'ok', since: '2026-10-22T08:00:00-05:00', checkedWeek: '2026-W43' });
+  assert.equal(w.stateWrites.length, 1);
+});
+
+test('a failed send in the same week writes nothing', async () => {
+  const w = makeWorld({ stored: okState(), page: { status: 500 }, sendError: true });
+  await watch(w.opts());
+  assert.equal(w.stateWrites.length, 0);
+});
+
+test('the real sender: with no send passed, a confirmed fault is POSTed to ntfy.sh/<topic>', async () => {
+  const w = makeWorld({ stored: okState(), page: { status: 500 } });
+  const o = w.opts();
+  delete o.send;
+  const r = await watch(o);
+  assert.equal(r.ok, true);
+  assert.equal(w.ntfyCalls.length, 1);
+  assert.equal(w.ntfyCalls[0].url, `https://ntfy.sh/${TOPIC}`);
+  assert.equal(w.ntfyCalls[0].init.method, 'POST');
+  assert.equal(w.ntfyCalls[0].init.body, 'PulseBoard: the site is not answering (since 20:13)');
+});
+
+test('the real sender: ntfy answering 500 fails the run', async () => {
+  const w = makeWorld({ stored: okState(), page: { status: 500 }, ntfyStatus: 500 });
+  const o = w.opts();
+  delete o.send;
+  const r = await watch(o);
+  assert.equal(r.ok, false);
+  assert.deepEqual(w.stored, okState());
+});
+
+test('every log line is one of the known forms and none holds the topic', async () => {
+  const known = [
+    /^(page|health|snapshot): pass$/,
+    /^(page|health|snapshot): fail \([^)]{1,60}\)$/,
+    /^a check failed; second look in 2 minutes$/,
+    /^notify: sent$/,
+    /^notify: fail \(could not send\)$/,
+    /^would send: (nothing|PulseBoard: .+)$/,
+    /^state would be: [a-z+-]+ \(dry run, nothing saved\)$/,
+    /^error: NTFY_TOPIC is not set; nothing was checked and nothing was sent$/,
+  ];
+  const runs = [
+    async () => { const w = makeWorld({ stored: okState() }); await watch(w.opts()); return w; },
+    async () => { const w = makeWorld({ stored: okState(), page: { status: 500 } }); w.health.body.store = 'error'; await watch(w.opts()); return w; },
+    async () => { const w = makeWorld({ stored: okState(), page: 'throw', sendError: true }); await watch(w.opts()); return w; },
+    async () => { const w = makeWorld({ stored: okState(), page: 'hang' }); await watch(w.opts({ timeoutMs: 20 })); return w; },
+    async () => { const w = makeWorld({ stored: okState(), page: { status: 500 } }); await watch(w.opts({ dryRun: true })); return w; },
+    async () => { const w = makeWorld({ stored: okState() }); await watch(w.opts({ env: {} })); return w; },
+  ];
+  for (const run of runs) {
+    const w = await run();
+    assert.ok(w.logs.length > 0);
+    for (const line of w.logs) {
+      assert.ok(known.some((re) => re.test(line)), 'unknown log line: ' + line);
+      assert.ok(!line.includes(TOPIC));
+    }
+  }
+});
+
+// ---------- the workflow and package files ----------
+
+const watchYml = () => fs.readFileSync(new URL('./.github/workflows/watch.yml', import.meta.url), 'utf8');
+
+test('watch.yml checks out main, so a queued run reads the state the run before it committed', () => {
+  assert.match(watchYml(), /uses: actions\/checkout@v5\s+with:\s+ref: main/);
+});
+
+test('watch.yml retries pull and push three times, 5 seconds apart, and fails if all fail', () => {
+  const y = watchYml();
+  assert.match(y, /for attempt in 1 2 3/);
+  assert.match(y, /git pull --rebase/);
+  assert.match(y, /git push/);
+  assert.match(y, /sleep 5/);
+  assert.match(y, /exit 1/);
+});
+
+test('watch.yml saves the state even when the check step failed, so the weekly keep-alive survives an ntfy outage', () => {
+  assert.match(watchYml(), /name: Save the state[^\n]*\n\s+if: \$\{\{ !cancelled\(\) \}\}/);
+});
+
+test('package.json says Node 20.11 or newer, as watch.mjs does', () => {
+  const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+  assert.equal(pkg.engines.node, '>=20.11');
+  assert.match(fs.readFileSync(new URL('./watch.mjs', import.meta.url), 'utf8').split('\n')[0], /Node 20\.11\+/);
 });

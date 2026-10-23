@@ -12,6 +12,8 @@ Every 10 minutes (at 3, 13, 23, 33, 43 and 53 minutes past the hour) a GitHub jo
 
 A request that takes longer than 15 seconds, or cannot connect, counts as a failure. If any check fails, the job waits two minutes and looks again. Only a fault seen both times counts, so a short hiccup stays quiet.
 
+GitHub sometimes runs a scheduled job late or skips one, so a quiet phone is good news only as far as the last run went.
+
 ## What a message looks like
 
 All times are Central.
@@ -19,9 +21,10 @@ All times are Central.
 - `PulseBoard: the site is not answering (since 20:13)`
 - `PulseBoard: the database check failed (since 20:13)`
 - `PulseBoard: prices on the site are 4 minutes old (since 20:13)`
+- `PulseBoard: the site is not answering and the database check failed (since 20:13)` (when more than one thing is broken, they are joined with "and")
 - `PulseBoard: fixed, all fine since 20:41`
 
-You get one message when a fault is confirmed, one more if what is broken changes, and one when everything passes again. While nothing changes, nothing is sent.
+You get one message when a fault is confirmed, one more whenever the set of broken things changes, and one when everything passes again. While nothing changes, nothing is sent.
 
 ## The topic is a secret
 
@@ -37,7 +40,7 @@ On your own computer, a safe test that checks the live site and sends nothing:
 node watch.mjs --dry-run
 ```
 
-The tests need no network: `node --test`.
+The tests need no network: `node --test`. They also run on every push (the "test" workflow).
 
 ## Stop it
 
@@ -45,6 +48,6 @@ On GitHub: Actions, then "watch", then the three dots, then "Disable workflow".
 
 ## What it keeps
 
-`state.json` holds only words and times: `ok` or a short name of what broke, since when, and the ISO week of the last run. The job commits it when it changes, and once a week so GitHub does not switch off the schedule in a quiet public repository.
+`state.json` holds only words and times: `ok` or short names of what broke (joined with `+` when several things are broken), since when, and the ISO week of the last run. The job commits it when it changes, and once a week so GitHub does not switch off the schedule in a quiet public repository.
 
 It holds nothing of anyone's holdings, accounts or sign-ins. The logs say only which checks passed or failed.

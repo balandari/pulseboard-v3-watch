@@ -19,6 +19,8 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@v5
+        with:
+          ref: main
 
       - name: Set up Node 24
         uses: actions/setup-node@v5
@@ -31,15 +33,29 @@ jobs:
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
 
+      # Runs even when the check step failed (for example ntfy was down), so the weekly keep-alive still lands.
       - name: Save the state (only if it changed, or the week changed)
+        if: ${{ !cancelled() }}
         run: |
           if [ -n "$(git status --porcelain -- state.json)" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add state.json
             git commit -m "chore: update watcher state"
-            git pull --rebase
-            git push
+            ok=0
+            for attempt in 1 2 3; do
+              if git pull --rebase && git push; then
+                ok=1
+                break
+              fi
+              echo "push failed (try $attempt of 3)"
+              git rebase --abort 2>/dev/null || true
+              if [ "$attempt" -lt 3 ]; then sleep 5; fi
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "could not save state.json after 3 tries"
+              exit 1
+            fi
           else
             echo "state.json did not change"
           fi
